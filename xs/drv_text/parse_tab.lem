@@ -1,0 +1,489 @@
+%include {
+#include "parse_int.h"
+
+struct st_csv_limit {
+	size_t						limit;
+	size_t						offset;
+};
+
+struct st_csv_column_type {
+	const char *name;
+	size_t name_len;
+	size_t size;
+};
+
+struct st_csv_join {
+	int op;
+	Expr *table;
+	Token *alias;
+	Expr *condition;
+};
+}  
+
+%token_prefix TK_
+
+%token_type                           { Token }
+%default_type                         { Token }
+
+%token_destructor {
+	/*
+	if( $$.dyn )
+		free( (char *) $$.str );
+	*/
+}
+
+%extra_argument                       { csv_parse_t *parse }
+
+%stack_overflow {
+	csv_error_msg( parse, CSV_ERR_STACKOVERFLOW, "Stack overflow" );
+}
+
+%syntax_error {
+	if( ! parse->csv->last_errno )
+		csv_error_msg(
+			parse, CSV_ERR_SYNTAX, "Syntax error near '%s'", TOKEN.str );
+}
+
+// *** input handling ***
+
+input ::= cmdlist.
+cmdlist ::= cmdlist ecmd.
+cmdlist ::= ecmd.
+cmdx ::= cmd.
+ecmd ::= SEMI.
+ecmd ::= explain cmdx SEMI.
+explain ::= .                         { csv_begin_parse( parse ); }
+
+// *** CREATE TABLE ***
+
+cmd ::= create_table create_table_args.
+
+create_table ::= CREATE TABLE ifnotexists(E) id(T). {
+	csv_start_table( parse, T, E );
+}
+
+%type ifnotexists                     { int }
+ifnotexists(A) ::= .                  { A = 0; }
+ifnotexists(A) ::= IF NOT EXISTS.     { A = 1; }
+
+create_table_args ::= LP columnlist RP.
+
+columnlist ::= columnlist COMMA column.
+columnlist ::= column.
+
+column ::= id(X) ctype(T) carglist(L). {
+	csv_table_add_column( parse, X, T.name, T.name_len, T.size, L );
+}
+
+%type ctype                           { struct st_csv_column_type }
+ctype(A) ::= ID(X). {
+	A.name = X.str;
+	A.name_len = X.len;
+	A.size = 0;
+}
+ctype(A) ::= ID(X) LP INT(S) RP. {
+	A.name = X.str;
+	A.name_len = X.len;
+	A.size = (size_t) atoi( S.str );
+}
+
+%type carglist                        { ExprList * }
+%destructor carglist                  { csv_exprlist_free( $$ ); }
+carglist(A) ::= .                     { A = 0; }
+carglist(A) ::= carglist(L) carg(X).  { A = csv_exprlist_add( L, X, 0 ); }
+
+%type carg                            { Expr * }
+%destructor carg                      { csv_expr_free( $$ ); }
+carg(A) ::= DEFAULT(O) ARG|INT|FLOAT|HEX(X). {
+	A = csv_expr( @X, 0, 0, 0, &X );
+	A->var.iv = @O;
+}
+carg(A) ::= DEFAULT(O) ADD INT|FLOAT|HEX(X). {
+	A = csv_expr( @X, 0, 0, 0, &X );
+	A->var.iv = @O;
+}
+carg(A) ::= DEFAULT(O) SUB INT|FLOAT|HEX(X). {
+	A = csv_expr( @X, 0, 0, 0, &X );
+	A = csv_expr( TK_MINUS, A, 0, 0, 0 );
+	A->var.iv = @O;
+}
+carg(A) ::= NULL. {
+	A = csv_expr( TK_ISNULL, 0, 0, 0, 0 );
+	A->var.iv = TK_ISNULL;
+}
+carg(A) ::= NOT NULL. {
+	A = csv_expr( TK_NOTNULL, 0, 0, 0, 0 );
+	A->var.iv = TK_NOTNULL;
+}
+
+// *** DROP TABLE ***
+
+cmd ::= DROP TABLE ifexists(E) id(T). {
+	csv_start_drop_table( parse, T, E );
+}
+
+%type ifexists                        { int }
+ifexists(A) ::= IF EXISTS.            { A = 1; }
+ifexists(A) ::= .                     { A = 0; }
+
+// *** INSERT ***
+
+cmd ::= INSERT INTO id(T) inscollist(C) VALUES LP itemlist(V) RP. {
+	csv_start_insert( parse, T, C, V );
+}
+
+%type inscollist                          { ExprList* }
+%destructor inscollist                    { csv_exprlist_free( $$ ); }
+inscollist(A) ::= .                       { A = 0; }
+inscollist(A) ::= LP inscollist(X) RP.    { A = X; }
+inscollist(A) ::= inscollist(L) COMMA id(X).
+                                          { A = csv_exprlist_add( L, X, 0 ); }
+inscollist(A) ::= id(X).                  { A = csv_exprlist_add( 0, X, 0 ); }
+
+%type itemlist                              { ExprList * }
+%destructor itemlist                        { csv_exprlist_free( $$ ); }
+itemlist(A) ::= itemlist(L) COMMA arg(X).   { A = csv_exprlist_add( L, X, 0 ); }
+itemlist(A) ::= arg(X).                     { A = csv_exprlist_add( 0, X, 0 ); }
+
+// *** UPDATE ***
+
+cmd ::= UPDATE id(X) SET setlist(Y) where_opt(Z).  {
+	csv_start_update( parse, X, Y, Z );
+}
+
+%type setlist                         { ExprList * }
+%destructor setlist                   { csv_exprlist_free( $$ ); }
+
+setlist(A) ::= setlist(Z) COMMA id(X) EQ expr(Y). {
+	X->left = Y;
+	A = csv_exprlist_add( Z, X, 0 );
+}
+setlist(A) ::= id(X) EQ expr(Y). {
+	X->left = Y;
+	A = csv_exprlist_add( 0, X, 0 );
+}
+
+// *** DELETE ***
+
+cmd ::= DELETE FROM id(X) where_opt(W).  {
+	csv_start_delete( parse, X, W );
+}
+
+// *** SELECT ***
+
+cmd ::= select(X).                    { csv_select_start( parse, X ); }
+
+%type select                          { csv_select_t* }
+%destructor select                    { csv_select_free( $$ ); }
+
+select(A) ::= SELECT selcollist(C) from(T) join_opt(J) where_opt(W)
+	groupby_opt(G) orderby_opt(O) limit_opt(L).
+{
+	A = csv_select_new( parse, C, T, J, W, G, O, L.limit, L.offset );
+}
+
+// *** table list ***
+
+%type from                            { ExprList* }
+%destructor from                      { csv_exprlist_free( $$ ); }
+from(A) ::= .                         { A = 0; }
+from(A) ::= FROM tablelist(X).        { A = X; }
+
+%type tablelist                       { ExprList* }
+%destructor tablelist                 { csv_exprlist_free( $$ ); }
+%type tlp                             { ExprList* }
+%destructor tlp                       { csv_exprlist_free( $$ ); }
+tlp(A) ::= tablelist(X) COMMA.        { A = X; }
+tlp(A) ::= .                          { A = 0; }
+tablelist(A) ::= tlp(L) id(X) as(Y). {
+	A = csv_exprlist_add( L, X, Y.len ? &Y : 0 );
+}
+
+/*** join_opt ***/
+%type join_opt                        { ExprList* }
+%destructor join_opt                  { csv_exprlist_free( $$ ); }
+%type join_entry                      { struct st_csv_join }
+join_opt(A) ::= .                     { A = 0; }
+join_opt(A) ::= join_opt(L) join_entry(E). {
+	A = csv_exprlist_add(
+		L, csv_expr( E.op, E.table, E.condition, 0, 0 ), E.alias );
+}
+join_entry(A) ::= join_type(OP) id(T) as(Y) ON expr(X). {
+	A.op = OP;
+	A.table = T;
+	A.alias = Y.len ? &Y : 0;
+	A.condition = X;
+}
+%type join_type                       { int }
+join_type(A) ::= JOIN.                { A = TK_INNER; }
+join_type(A) ::= INNER|CROSS JOIN.    { A = TK_INNER; }
+join_type(A) ::= LEFT JOIN.           { A = TK_LEFT; }
+
+// *** where_opt ***
+%type where_opt                       { Expr* }
+%destructor where_opt                 { csv_expr_free( $$ ); }
+where_opt(A) ::= .                    { A = 0; }
+where_opt(A) ::= WHERE expr(X).       { A = X; }
+
+// *** groupby_opt ***
+%type groupby_opt                         { ExprList* }
+%destructor groupby_opt                   { csv_exprlist_free( $$ ); }
+groupby_opt(A) ::= .                      { A = 0; }
+groupby_opt(A) ::= GROUP BY exprlist(X).  { A = X; }
+
+// *** orderby_opt ***
+%type orderby_opt                     { ExprList* }
+%destructor orderby_opt               { csv_exprlist_free( $$ ); }
+%type sortlist                        { ExprList* }
+%destructor sortlist                  { csv_exprlist_free( $$ ); }
+
+orderby_opt(A) ::= .                          { A = 0; }
+orderby_opt(A) ::= ORDER BY sortlist(X).      { A = X; }
+sortlist(A) ::= sortlist(X) COMMA id(Y) sortorder(Z). {
+	Y->flags |= Z;
+	A = csv_exprlist_add( X, Y, 0 );
+}
+sortlist(A) ::= id(Y) sortorder(Z). {
+	Y->flags |= Z;
+	A = csv_exprlist_add( 0, Y, 0 );
+}
+
+%type sortorder                       { int }
+sortorder(A) ::= .                    { A = EXPR_SORT_ASC; }
+sortorder(A) ::= ASC.                 { A = EXPR_SORT_ASC; }
+sortorder(A) ::= DESC.                { A = 0; }
+
+// *** limit_opt ***
+
+%type limit_opt                       { struct st_csv_limit }
+limit_opt(A) ::= .                    { A.limit = 0; A.offset = 0; }
+limit_opt(A) ::= LIMIT INT(X).        { A.limit = atoi( X.str ); A.offset = 0; }
+limit_opt(A) ::= LIMIT INT(X) OFFSET INT(Y). {
+	A.limit = atoi( X.str ); A.offset = atoi( Y.str );
+}
+limit_opt(A) ::= LIMIT INT(X) COMMA INT(Y). {
+	A.offset = atoi( X.str ); A.limit = atoi( Y.str );
+}
+
+// *** SET ***
+
+cmd ::= SET ID(K) EQ INT|FLOAT|ARG|ID|QID|HEX(V). {
+	csv_set_start( parse,
+		csv_expr( @K, 0, 0, 0, &K ), csv_expr( @V, 0, 0, 0, &V ) );
+}
+
+// *** SHOW ***
+
+cmd ::= SHOW VARIABLES. {
+	csv_start_show_variables( parse, NULL );
+}
+
+cmd ::= SHOW VARIABLES LIKE ARG(X). {
+	csv_start_show_variables( parse, csv_expr( @X, 0, 0, 0, &X ) );
+}
+
+/* aggregate functions */
+expr(A) ::= SUM(F) LP expr(X) RP(R).
+{ A = csv_expr( @F, X, 0, 0, &F ); expr_token_len( A, &R ); }
+expr(A) ::= MIN(F) LP expr(X) RP(R).
+{ A = csv_expr( @F, X, 0, 0, &F ); expr_token_len( A, &R ); }
+expr(A) ::= MAX(F) LP expr(X) RP(R).
+{ A = csv_expr( @F, X, 0, 0, &F ); expr_token_len( A, &R ); }
+expr(A) ::= COUNT(F) LP expr(X) RP(R).
+{ A = csv_expr( @F, X, 0, 0, &F ); expr_token_len( A, &R ); }
+expr(A) ::= COUNT(F) LP MUL RP(R).
+{ A = csv_expr( @F, 0, 0, 0, &F ); expr_token_len( A, &R ); }
+expr(A) ::= AVG(F) LP expr(X) RP(R).
+{ A = csv_expr( @F, X, 0, 0, &F ); expr_token_len( A, &R ); }
+
+/* numeric functions */
+expr(A) ::= ABS(F) LP expr(X) RP(R).
+{ A = csv_expr( @F, X, 0, 0, &F ); expr_token_len( A, &R ); }
+expr(A) ::= ROUND(F) LP expr(X) RP(R).
+{ A = csv_expr( @F, X, 0, 0, &F ); expr_token_len( A, &R ); }
+expr(A) ::= ROUND(F) LP expr(X) COMMA expr(Y) RP(R).
+{ A = csv_expr( @F, X, Y, 0, &F ); expr_token_len( A, &R ); }
+
+/* string functions */
+expr(A) ::= CONCAT(F) LP exprlist(L) RP(R).
+{ A = csv_expr( @F, 0, 0, L, &F ); expr_token_len( A, &R ); }
+expr(A) ::= LOWER(F) LP expr(X) RP(R).
+{ A = csv_expr( @F, X, 0, 0, &F ); expr_token_len( A, &R ); }
+expr(A) ::= UPPER(F) LP expr(X) RP(R).
+{ A = csv_expr( @F, X, 0, 0, &F ); expr_token_len( A, &R ); }
+expr(A) ::= TRIM(F) LP expr(X) RP(R). {
+	A = csv_expr( @F, X, csv_expr( TK_BOTH, 0, 0, 0, 0 ), 0, &F );
+	expr_token_len( A, &R );
+}
+expr(A) ::= TRIM(F) LP LEADING|TRAILING|BOTH(OP) expr(X) RP(R). {
+	A = csv_expr( @F, X, csv_expr( @OP, 0, 0, 0, &OP ), 0, &F );
+	expr_token_len( A, &R );
+}
+expr(A) ::= TRIM(F) LP LEADING|TRAILING|BOTH(OP) expr(W) FROM expr(X) RP(R). {
+	A = csv_expr( @F, X, csv_expr( @OP, W, 0, 0, &OP ), 0, &F );
+	expr_token_len( A, &R );
+}
+expr(A) ::= LTRIM(F) LP expr(X) RP(R).
+{ A = csv_expr( @F, X, 0, 0, &F ); expr_token_len( A, &R ); }
+expr(A) ::= RTRIM(F) LP expr(X) RP(R).
+{ A = csv_expr( @F, X, 0, 0, &F ); expr_token_len( A, &R ); }
+expr(A) ::= LENGTH(F) LP expr(X) RP(R).
+{ A = csv_expr( @F, X, 0, 0, &F ); expr_token_len( A, &R ); }
+expr(A) ::= CHAR_LENGTH(F) LP expr(X) RP(R).
+{ A = csv_expr( @F, X, 0, 0, &F ); expr_token_len( A, &R ); }
+expr(A) ::= SUBSTR(F) LP expr(X) FROM|COMMA expr(S) FOR|COMMA expr(L) RP(R). {
+	ExprList *l = csv_exprlist_add( 0, S, 0 );
+	l = csv_exprlist_add( l, L, 0 );
+	A = csv_expr( @F, X, 0, l, &F );
+	expr_token_len( A, &R );
+}
+expr(A) ::= SUBSTR(F) LP expr(X) FROM|COMMA expr(S) RP(R). {
+	A = csv_expr( @F, X, 0, csv_exprlist_add( 0, S, 0 ), &F );
+	expr_token_len( A, &R );
+}
+expr(A) ::= LOCATE(F) LP expr(X) COMMA expr(Y) RP(R).
+{ A = csv_expr( @F, X, Y, 0, &F ); expr_token_len( A, &R ); }
+expr(A) ::= LOCATE(F) LP expr(X) COMMA expr(Y) COMMA expr(Z) RP(R). {
+	A = csv_expr( @F, X, Y, csv_exprlist_add( 0, Z, 0 ), &F );
+	expr_token_len( A, &R );
+}
+expr(A) ::= POSITION(F) LP expr(X) IN expr(Y) RP(R).
+{ A = csv_expr( TK_LOCATE, X, Y, 0, &F ); expr_token_len( A, &R ); }
+expr(A) ::= ASCII(F) LP expr(X) RP(R).
+{ A = csv_expr( @F, X, 0, 0, &F ); expr_token_len( A, &R ); }
+
+/* time functions */
+expr(A) ::= CURRENT_TIMESTAMP(F).    { A = csv_expr( @F, 0, 0, 0, &F ); }
+expr(A) ::= CURRENT_TIMESTAMP(F) LP RP(R).
+{ A = csv_expr( @F, 0, 0, 0, &F ); expr_token_len( A, &R ); }
+expr(A) ::= CURRENT_TIME(F).         { A = csv_expr( @F, 0, 0, 0, &F ); }
+expr(A) ::= CURRENT_TIME(F) LP RP(R).
+{ A = csv_expr( @F, 0, 0, 0, &F ); expr_token_len( A, &R ); }
+expr(A) ::= CURRENT_DATE(F).         { A = csv_expr( @F, 0, 0, 0, &F ); }
+expr(A) ::= CURRENT_DATE(F) LP RP(R).
+{ A = csv_expr( @F, 0, 0, 0, &F ); expr_token_len( A, &R ); }
+
+/* convert */
+expr(A) ::= CONVERT(F) LP expr(X) COMMA|USING(W) ctype(T) RP(R). {
+	Token __t;
+	Expr *__x;
+	__t.str = T.name, __t.len = T.name_len;
+	Newxz( __x, 1, Expr );
+	__x->var.iv = (long) T.size;
+	__x->var.flags = VAR_HAS_IV;
+	__x->op = @W;
+	A = csv_expr( @F, X, csv_expr( TK_PLAIN, __x, 0, 0, &__t ), 0, &F );
+	expr_token_len( A, &R );
+}
+
+/* if */
+expr(A) ::= IF(OP) LP expr(W) COMMA expr(X) COMMA expr(Y) RP. {
+	ExprList *l = csv_exprlist_add( 0, X, 0 );
+	l = csv_exprlist_add( l, Y, 0 );
+	A = csv_expr( @OP, W, 0, l, 0 );
+}
+
+// *** column list ***
+
+%type selcollist                      { ExprList* }
+%destructor selcollist                { csv_exprlist_free( $$ ); }
+%type sclp                            { ExprList* }
+%destructor sclp                      { csv_exprlist_free( $$ ); }
+sclp(A) ::= selcollist(X) COMMA.      { A = X; }
+sclp(A) ::= .                         { A = 0; }
+selcollist(A) ::= sclp(L) expr(X) as(Y). {
+	A = csv_exprlist_add( L, X, Y.len ? &Y : 0 );
+}
+selcollist(A) ::= sclp(L) MUL. {
+	A = csv_exprlist_add( L, csv_expr( TK_ALL, 0, 0, 0, 0 ), 0 );
+}
+selcollist(A) ::= sclp(L) id(T) DOT(OP) MUL. {
+	A = csv_exprlist_add( L,
+		csv_expr( TK_DOT, T, csv_expr( TK_ALL, 0, 0, 0, 0 ), 0, &OP ), 0 );
+}
+
+// *** type as ***
+
+%type as                              { Token }
+as(A) ::= .                           { A.len = 0; }
+as(A) ::= ALIAS ID|QID|ARG(X).        { A = X; }
+as(A) ::= ID|QID|ARG(X).              { A = X; }
+
+// *** type arg ***
+
+%type arg                             { Expr * }
+%destructor arg                       { csv_expr_free( $$ ); }
+arg(A) ::= ARG|INT|FLOAT|HEX(O).      { A = csv_expr( @O, 0, 0, 0, &O ); }
+arg(A) ::= QUEST|NULL(X).             { A = csv_expr( @X, 0, 0, 0, &X ); }
+
+// *** type id ***
+
+%type id                              { Expr * }
+%destructor id                        { csv_expr_free( $$ ); }
+id(A) ::= ID|QID(O).                  { A = csv_expr( @O, 0, 0, 0, &O ); }
+
+// *** table.field ***
+
+%type field                           { Expr * }
+%destructor field                     { csv_expr_free( $$ ); }
+field(A) ::= id(X) DOT(OP) id(Y).     { A = csv_expr( TK_DOT, X, Y, 0, &OP ); }
+
+// *** expressions ***
+
+%left AND.
+%left OR.
+%right NOT.
+%left IS LIKE NOTLIKE ISNULL NOTNULL BETWEEN NE EQ.
+%left GT GE LT LE.
+%left BITAND BITOR SHL SHR.
+%left ADD SUB.
+%left MUL DIV MOD.
+%right EXP.
+%right MINUS PLUS.
+
+%type expr                               { Expr* }
+%destructor expr                         { csv_expr_free( $$ ); }
+
+expr(A) ::= expr(X) AND(OP) expr(Y).     { A = csv_expr( @OP, X, Y, 0, &OP ); }
+expr(A) ::= expr(X) OR(OP) expr(Y).      { A = csv_expr( @OP, X, Y, 0, &OP ); }
+expr(A) ::= expr(X) LT|LE|GT|GE(OP) expr(Y).
+                                         { A = csv_expr( @OP, X, Y, 0, &OP ); }
+expr(A) ::= expr(X) BITAND|BITOR|SHL|SHR(OP) expr(Y).
+                                         { A = csv_expr( @OP, X, Y, 0, &OP ); }
+expr(A) ::= expr(X) EQ|NE(OP) expr(Y).   { A = csv_expr( @OP, X, Y, 0, &OP ); }
+expr(A) ::= expr(X) ADD|SUB(OP) expr(Y). { A = csv_expr( @OP, X, Y, 0, &OP ); }
+expr(A) ::= expr(X) MUL|DIV|MOD|EXP(OP) expr(Y).
+                                         { A = csv_expr( @OP, X, Y, 0, &OP ); }
+expr(A) ::= arg(X).                      { A = X; }
+expr(A) ::= id(X).                       { A = X; }
+expr(A) ::= field(X).                    { A = X; }
+expr(A) ::= expr(X) LIKE(OP) ARG|QUEST(Y). {
+	A = csv_expr( TK_LIKE, X, csv_expr( @Y, 0, 0, 0, &Y ), 0, &OP );
+}
+expr(A) ::= expr(X) NOT(T1) LIKE(T2) ARG|QUEST(Y). {
+	A = csv_expr( TK_NOTLIKE, X, csv_expr( @Y, 0, 0, 0, &Y ), 0, &T1 );
+	expr_token_len( A, &T2 );
+}
+expr(A) ::= LP(L) expr(X) RP(R). {
+	A = X;
+	expr_token_len( A, &L );
+	expr_token_len( A, &R );
+}
+expr(A) ::= NOT(O) expr(X).           { A = csv_expr( @O, X, 0, 0, 0 ); }
+expr(A) ::= expr(X) IS NULL.          { A = csv_expr( TK_ISNULL, X, 0, 0, 0 ); }
+expr(A) ::= expr(X) IS NOT NULL.      { A = csv_expr( TK_NOTNULL, X, 0, 0, 0 ); }
+expr(A) ::= SUB(O) expr(X). [MINUS]   { A = csv_expr( TK_MINUS, X, 0, 0, &O ); }
+expr(A) ::= ADD(O) expr(X). [PLUS]    { A = csv_expr( TK_PLUS, X, 0, 0, &O ); }
+expr(A) ::= expr(W) BETWEEN expr(X) AND expr(Y). [BETWEEN] {
+	ExprList *l = csv_exprlist_add( 0, X, 0 );
+	l = csv_exprlist_add( l, Y, 0 );
+	A = csv_expr( TK_BETWEEN, W, 0, l, 0 );
+}
+
+// *** expression list ***
+
+%type exprlist                        { ExprList* }
+%destructor exprlist                  { csv_exprlist_free( $$ ); }
+exprlist(A) ::= .                     { A = 0; }
+exprlist(A) ::= exprlist(L) expr(X).  { A = csv_exprlist_add( L, X, 0 ); }
+exprlist(A) ::= exprlist(X) COMMA.    { A = X; }
